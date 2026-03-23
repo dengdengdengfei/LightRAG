@@ -709,6 +709,7 @@ class DocStatus(str, Enum):
     PROCESSING = "processing"
     PREPROCESSED = "preprocessed"
     PROCESSED = "processed"
+    PARTIAL = "partial"  # Some chunks failed, successful ones were persisted
     FAILED = "failed"
 
 

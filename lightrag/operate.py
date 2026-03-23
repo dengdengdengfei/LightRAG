@@ -793,27 +793,28 @@ async def rebuild_knowledge_from_chunks(
             pipeline_status["latest_message"] = status_message
             pipeline_status["history_messages"].append(status_message)
 
-    # Execute all tasks — skip failures, continue with successful ones
-    done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+    # Rebuild uses FIRST_EXCEPTION — partial rebuild during delete is unsafe
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
-    failed_rebuilds = 0
+    first_exception = None
     for task in done:
         try:
-            exc = task.exception()
-            if exc is not None:
-                failed_rebuilds += 1
-                logger.warning("KG rebuild task failed (skipped): %s", exc)
+            exception = task.exception()
+            if exception is not None:
+                if first_exception is None:
+                    first_exception = exception
             else:
                 task.result()
         except Exception as e:
-            failed_rebuilds += 1
-            logger.warning("KG rebuild task failed (skipped): %s", e)
+            if first_exception is None:
+                first_exception = e
 
-    if failed_rebuilds:
-        logger.warning(
-            "KG rebuild: %d/%d tasks failed (skipped)",
-            failed_rebuilds, len(tasks),
-        )
+    if first_exception is not None:
+        for pending_task in pending:
+            pending_task.cancel()
+        if pending:
+            await asyncio.wait(pending)
+        raise first_exception
 
     # Final status report
     status_message = f"KG rebuild completed: {rebuilt_entities_count} entities and {rebuilt_relationships_count} relationships rebuilt successfully."
@@ -3011,28 +3012,29 @@ async def extract_entities(
     done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
 
     chunk_results = []
-    failed_chunks: list[dict] = []
+    failed_chunk_ids: list[str] = []
 
-    for task in done:
+    for i, task in enumerate(done):
         try:
             exc = task.exception()
             if exc is not None:
-                failed_chunks.append({"error": str(exc)})
+                # Extract chunk_id from error message prefix if available
+                failed_chunk_ids.append(str(exc).split(":")[0] if ":" in str(exc) else f"chunk_{i}")
                 logger.warning("Chunk extraction failed (skipped): %s", exc)
             else:
                 chunk_results.append(task.result())
         except Exception as e:
-            failed_chunks.append({"error": str(e)})
+            failed_chunk_ids.append(f"chunk_{i}")
             logger.warning("Chunk extraction failed (skipped): %s", e)
 
-    if failed_chunks:
+    if failed_chunk_ids:
         logger.warning(
             "Entity extraction: %d/%d chunks failed (skipped), %d succeeded",
-            len(failed_chunks), len(tasks), len(chunk_results),
+            len(failed_chunk_ids), len(tasks), len(chunk_results),
         )
 
-    # Return successful results — caller handles partial data
-    return chunk_results
+    # Return (results, failed_ids) — caller decides status based on failures
+    return chunk_results, failed_chunk_ids
 
 
 async def kg_query(

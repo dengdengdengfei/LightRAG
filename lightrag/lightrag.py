@@ -1984,7 +1984,7 @@ class LightRAG:
                                     chunks, pipeline_status, pipeline_status_lock
                                 )
                             )
-                            chunk_results = await entity_relation_task
+                            chunk_results, failed_chunk_ids = await entity_relation_task
                             file_extraction_stage_ok = True
 
                         except Exception as e:
@@ -2094,10 +2094,26 @@ class LightRAG:
                                 # Record processing end time
                                 processing_end_time = int(time.time())
 
+                                # Determine status: PARTIAL if some chunks failed
+                                doc_final_status = (
+                                    DocStatus.PARTIAL if failed_chunk_ids
+                                    else DocStatus.PROCESSED
+                                )
+                                status_metadata = {
+                                    "processing_start_time": processing_start_time,
+                                    "processing_end_time": processing_end_time,
+                                }
+                                if failed_chunk_ids:
+                                    status_metadata["failed_chunk_ids"] = failed_chunk_ids
+                                    logger.warning(
+                                        "Document %s: %d chunks failed, marking as PARTIAL",
+                                        doc_id, len(failed_chunk_ids),
+                                    )
+
                                 await self.doc_status.upsert(
                                     {
                                         doc_id: {
-                                            "status": DocStatus.PROCESSED,
+                                            "status": doc_final_status,
                                             "chunks_count": len(chunks),
                                             "chunks_list": list(chunks.keys()),
                                             "content_summary": status_doc.content_summary,
@@ -2107,11 +2123,8 @@ class LightRAG:
                                                 timezone.utc
                                             ).isoformat(),
                                             "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
-                                            "metadata": {
-                                                "processing_start_time": processing_start_time,
-                                                "processing_end_time": processing_end_time,
-                                            },
+                                            "track_id": status_doc.track_id,
+                                            "metadata": status_metadata,
                                         }
                                     }
                                 )
@@ -2261,9 +2274,10 @@ class LightRAG:
 
     async def _process_extract_entities(
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
-    ) -> list:
+    ) -> tuple[list, list[str]]:
+        """Returns (chunk_results, failed_chunk_ids)."""
         try:
-            chunk_results = await extract_entities(
+            chunk_results, failed_chunk_ids = await extract_entities(
                 chunk,
                 global_config=asdict(self),
                 pipeline_status=pipeline_status,
@@ -2271,13 +2285,21 @@ class LightRAG:
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
             )
-            return chunk_results
+            if failed_chunk_ids:
+                error_msg = f"Partial extraction: {len(failed_chunk_ids)} chunks failed"
+                logger.warning(error_msg)
+                if pipeline_status_lock:
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = error_msg
+                        pipeline_status["history_messages"].append(error_msg)
+            return chunk_results, failed_chunk_ids
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"
             logger.error(error_msg)
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = error_msg
-                pipeline_status["history_messages"].append(error_msg)
+            if pipeline_status_lock:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = error_msg
+                    pipeline_status["history_messages"].append(error_msg)
             raise e
 
     async def _insert_done(
