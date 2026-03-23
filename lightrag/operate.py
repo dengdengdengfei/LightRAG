@@ -793,37 +793,27 @@ async def rebuild_knowledge_from_chunks(
             pipeline_status["latest_message"] = status_message
             pipeline_status["history_messages"].append(status_message)
 
-    # Execute all tasks in parallel with semaphore control and early failure detection
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    # Execute all tasks — skip failures, continue with successful ones
+    done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
 
-    # Check if any task raised an exception and ensure all exceptions are retrieved
-    first_exception = None
-
+    failed_rebuilds = 0
     for task in done:
         try:
-            exception = task.exception()
-            if exception is not None:
-                if first_exception is None:
-                    first_exception = exception
+            exc = task.exception()
+            if exc is not None:
+                failed_rebuilds += 1
+                logger.warning("KG rebuild task failed (skipped): %s", exc)
             else:
-                # Task completed successfully, retrieve result to mark as processed
                 task.result()
         except Exception as e:
-            if first_exception is None:
-                first_exception = e
+            failed_rebuilds += 1
+            logger.warning("KG rebuild task failed (skipped): %s", e)
 
-    # If any task failed, cancel all pending tasks and raise the first exception
-    if first_exception is not None:
-        # Cancel all pending tasks
-        for pending_task in pending:
-            pending_task.cancel()
-
-        # Wait for cancellation to complete
-        if pending:
-            await asyncio.wait(pending)
-
-        # Re-raise the first exception to notify the caller
-        raise first_exception
+    if failed_rebuilds:
+        logger.warning(
+            "KG rebuild: %d/%d tasks failed (skipped)",
+            failed_rebuilds, len(tasks),
+        )
 
     # Final status report
     status_message = f"KG rebuild completed: {rebuilt_entities_count} entities and {rebuilt_relationships_count} relationships rebuilt successfully."
@@ -2585,38 +2575,28 @@ async def merge_nodes_and_edges(
         task = asyncio.create_task(_locked_process_entity_name(entity_name, entities))
         entity_tasks.append(task)
 
-    # Execute entity tasks with error handling
+    # Execute entity tasks — skip failures, continue with successful ones
     processed_entities = []
     if entity_tasks:
-        done, pending = await asyncio.wait(
-            entity_tasks, return_when=asyncio.FIRST_EXCEPTION
+        done, _ = await asyncio.wait(
+            entity_tasks, return_when=asyncio.ALL_COMPLETED
         )
 
-        first_exception = None
-        processed_entities = []
-
+        failed_entities = 0
         for task in done:
             try:
                 result = task.result()
             except BaseException as e:
-                if first_exception is None:
-                    first_exception = e
+                failed_entities += 1
+                logger.warning("Entity merge failed (skipped): %s", e)
             else:
                 processed_entities.append(result)
 
-        if pending:
-            for task in pending:
-                task.cancel()
-            pending_results = await asyncio.gather(*pending, return_exceptions=True)
-            for result in pending_results:
-                if isinstance(result, BaseException):
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    processed_entities.append(result)
-
-        if first_exception is not None:
-            raise first_exception
+        if failed_entities:
+            logger.warning(
+                "Entity merge: %d/%d failed (skipped), %d succeeded",
+                failed_entities, len(entity_tasks), len(processed_entities),
+            )
 
     # ===== Phase 2: Process all relationships concurrently =====
     log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
@@ -2699,44 +2679,32 @@ async def merge_nodes_and_edges(
         task = asyncio.create_task(_locked_process_edges(edge_key, edges))
         edge_tasks.append(task)
 
-    # Execute relationship tasks with error handling
+    # Execute relationship tasks — skip failures, continue with successful ones
     processed_edges = []
     all_added_entities = []
 
     if edge_tasks:
-        done, pending = await asyncio.wait(
-            edge_tasks, return_when=asyncio.FIRST_EXCEPTION
+        done, _ = await asyncio.wait(
+            edge_tasks, return_when=asyncio.ALL_COMPLETED
         )
 
-        first_exception = None
-
+        failed_edges = 0
         for task in done:
             try:
                 edge_data, added_entities = task.result()
             except BaseException as e:
-                if first_exception is None:
-                    first_exception = e
+                failed_edges += 1
+                logger.warning("Edge merge failed (skipped): %s", e)
             else:
                 if edge_data is not None:
                     processed_edges.append(edge_data)
                 all_added_entities.extend(added_entities)
 
-        if pending:
-            for task in pending:
-                task.cancel()
-            pending_results = await asyncio.gather(*pending, return_exceptions=True)
-            for result in pending_results:
-                if isinstance(result, BaseException):
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    edge_data, added_entities = result
-                    if edge_data is not None:
-                        processed_edges.append(edge_data)
-                    all_added_entities.extend(added_entities)
-
-        if first_exception is not None:
-            raise first_exception
+        if failed_edges:
+            logger.warning(
+                "Edge merge: %d/%d failed (skipped), %d succeeded",
+                failed_edges, len(edge_tasks), len(processed_edges),
+            )
 
     # ===== Phase 3: Update full_entities and full_relations storage =====
     if full_entities_storage and full_relations_storage and doc_id:
@@ -3039,45 +3007,31 @@ async def extract_entities(
         task = asyncio.create_task(_process_with_semaphore(c))
         tasks.append(task)
 
-    # Wait for tasks to complete or for the first exception to occur
-    # This allows us to cancel remaining tasks if any task fails
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    # Wait for ALL tasks to complete — skip failed chunks instead of aborting
+    done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
 
-    # Check if any task raised an exception and ensure all exceptions are retrieved
-    first_exception = None
     chunk_results = []
+    failed_chunks: list[dict] = []
 
     for task in done:
         try:
-            exception = task.exception()
-            if exception is not None:
-                if first_exception is None:
-                    first_exception = exception
+            exc = task.exception()
+            if exc is not None:
+                failed_chunks.append({"error": str(exc)})
+                logger.warning("Chunk extraction failed (skipped): %s", exc)
             else:
                 chunk_results.append(task.result())
         except Exception as e:
-            if first_exception is None:
-                first_exception = e
+            failed_chunks.append({"error": str(e)})
+            logger.warning("Chunk extraction failed (skipped): %s", e)
 
-    # If any task failed, cancel all pending tasks and raise the first exception
-    if first_exception is not None:
-        # Cancel all pending tasks
-        for pending_task in pending:
-            pending_task.cancel()
+    if failed_chunks:
+        logger.warning(
+            "Entity extraction: %d/%d chunks failed (skipped), %d succeeded",
+            len(failed_chunks), len(tasks), len(chunk_results),
+        )
 
-        # Wait for cancellation to complete
-        if pending:
-            await asyncio.wait(pending)
-
-        # Add progress prefix to the exception message
-        progress_prefix = f"C[{processed_chunks + 1}/{total_chunks}]"
-
-        # Re-raise the original exception with a prefix
-        prefixed_exception = create_prefixed_exception(first_exception, progress_prefix)
-        raise prefixed_exception from first_exception
-
-    # If all tasks completed successfully, chunk_results already contains the results
-    # Return the chunk_results for later processing in merge_nodes_and_edges
+    # Return successful results — caller handles partial data
     return chunk_results
 
 
