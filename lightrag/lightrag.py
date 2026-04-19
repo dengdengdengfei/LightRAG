@@ -2072,7 +2072,7 @@ class LightRAG:
                                         )
 
                                 # Use chunk_results from entity_relation_task
-                                await merge_nodes_and_edges(
+                                merge_failed_entities, merge_failed_edges = await merge_nodes_and_edges(
                                     chunk_results=chunk_results,  # result collected from entity_relation_task
                                     knowledge_graph_inst=self.chunk_entity_relation_graph,
                                     entity_vdb=self.entities_vdb,
@@ -2094,9 +2094,10 @@ class LightRAG:
                                 # Record processing end time
                                 processing_end_time = int(time.time())
 
-                                # Determine status: PARTIAL if some chunks failed
+                                # Determine status: PARTIAL if chunks or merge operations failed
+                                has_failures = failed_chunk_ids or merge_failed_entities or merge_failed_edges
                                 doc_final_status = (
-                                    DocStatus.PARTIAL if failed_chunk_ids
+                                    DocStatus.PARTIAL if has_failures
                                     else DocStatus.PROCESSED
                                 )
                                 status_metadata = {
@@ -2108,6 +2109,13 @@ class LightRAG:
                                     logger.warning(
                                         "Document %s: %d chunks failed, marking as PARTIAL",
                                         doc_id, len(failed_chunk_ids),
+                                    )
+                                if merge_failed_entities or merge_failed_edges:
+                                    status_metadata["failed_entity_merges"] = merge_failed_entities
+                                    status_metadata["failed_edge_merges"] = merge_failed_edges
+                                    logger.warning(
+                                        "Document %s: %d entity merges, %d edge merges failed, marking as PARTIAL",
+                                        doc_id, merge_failed_entities, merge_failed_edges,
                                     )
 
                                 await self.doc_status.upsert(

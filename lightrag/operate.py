@@ -728,11 +728,12 @@ async def rebuild_knowledge_from_chunks(
                 except Exception as e:
                     failed_entities_count += 1
                     status_message = f"Failed to rebuild `{entity_name}`: {e}"
-                    logger.info(status_message)  # Per requirement, change to info
+                    logger.info(status_message)
                     if pipeline_status is not None and pipeline_status_lock is not None:
                         async with pipeline_status_lock:
                             pipeline_status["latest_message"] = status_message
                             pipeline_status["history_messages"].append(status_message)
+                    raise  # Re-raise so FIRST_EXCEPTION can catch it
 
     async def _locked_rebuild_relationship(src, tgt, chunk_ids):
         nonlocal rebuilt_relationships_count, failed_relationships_count
@@ -766,11 +767,12 @@ async def rebuild_knowledge_from_chunks(
                 except Exception as e:
                     failed_relationships_count += 1
                     status_message = f"Failed to rebuild `{src}`~`{tgt}`: {e}"
-                    logger.info(status_message)  # Per requirement, change to info
+                    logger.info(status_message)
                     if pipeline_status is not None and pipeline_status_lock is not None:
                         async with pipeline_status_lock:
                             pipeline_status["latest_message"] = status_message
                             pipeline_status["history_messages"].append(status_message)
+                    raise  # Re-raise so FIRST_EXCEPTION can catch it
 
     # Create tasks for parallel processing
     tasks = []
@@ -2448,13 +2450,16 @@ async def merge_nodes_and_edges(
     current_file_number: int = 0,
     total_files: int = 0,
     file_path: str = "unknown_source",
-) -> None:
+) -> tuple[int, int]:
     """Two-phase merge: process all entities first, then all relationships
 
     This approach ensures data consistency by:
     1. Phase 1: Process all entities concurrently
     2. Phase 2: Process all relationships concurrently (may add missing entities)
     3. Phase 3: Update full_entities and full_relations storage with final results
+
+    Returns:
+        (failed_entities, failed_edges): counts of failed merge operations
 
     Args:
         chunk_results: List of tuples (maybe_nodes, maybe_edges) containing extracted entities and relationships
@@ -2578,6 +2583,7 @@ async def merge_nodes_and_edges(
 
     # Execute entity tasks — skip failures, continue with successful ones
     processed_entities = []
+    failed_entities = 0
     if entity_tasks:
         done, _ = await asyncio.wait(
             entity_tasks, return_when=asyncio.ALL_COMPLETED
@@ -2587,6 +2593,8 @@ async def merge_nodes_and_edges(
         for task in done:
             try:
                 result = task.result()
+            except (PipelineCancelledException, asyncio.CancelledError):
+                raise
             except BaseException as e:
                 failed_entities += 1
                 logger.warning("Entity merge failed (skipped): %s", e)
@@ -2683,6 +2691,7 @@ async def merge_nodes_and_edges(
     # Execute relationship tasks — skip failures, continue with successful ones
     processed_edges = []
     all_added_entities = []
+    failed_edges = 0
 
     if edge_tasks:
         done, _ = await asyncio.wait(
@@ -2693,6 +2702,8 @@ async def merge_nodes_and_edges(
         for task in done:
             try:
                 edge_data, added_entities = task.result()
+            except (PipelineCancelledException, asyncio.CancelledError):
+                raise
             except BaseException as e:
                 failed_edges += 1
                 logger.warning("Edge merge failed (skipped): %s", e)
@@ -2773,10 +2784,14 @@ async def merge_nodes_and_edges(
             # Don't raise exception to avoid affecting main flow
 
     log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
+    if failed_entities or failed_edges:
+        log_message += f" (failures: {failed_entities} entities, {failed_edges} edges)"
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
+
+    return failed_entities, failed_edges
 
 
 async def extract_entities(
@@ -3018,11 +3033,16 @@ async def extract_entities(
         try:
             exc = task.exception()
             if exc is not None:
+                # Cancellation/pipeline-cancel must propagate, not be skipped
+                if isinstance(exc, (PipelineCancelledException, asyncio.CancelledError)):
+                    raise exc
                 # Extract chunk_id from error message prefix if available
                 failed_chunk_ids.append(str(exc).split(":")[0] if ":" in str(exc) else f"chunk_{i}")
                 logger.warning("Chunk extraction failed (skipped): %s", exc)
             else:
                 chunk_results.append(task.result())
+        except (PipelineCancelledException, asyncio.CancelledError):
+            raise
         except Exception as e:
             failed_chunk_ids.append(f"chunk_{i}")
             logger.warning("Chunk extraction failed (skipped): %s", e)
