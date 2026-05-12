@@ -66,6 +66,11 @@ class FaissVectorDBStorage(BaseVectorStorage):
         # Keep a local store for metadata, IDs, etc.
         # Maps <int faiss_id> → metadata (including your original ID).
         self._id_to_meta = {}
+        # Counter of orphaned fids (popped from _id_to_meta but still in _index)
+        # since the last compact. Triggers rebuild when threshold reached so
+        # IndexFlatIP rebuild cost is amortized instead of per-delete.
+        self._pending_delete_count = 0
+        self._compact_threshold = int(os.environ.get("FAISS_COMPACT_THRESHOLD", "1000"))
 
         self._load_faiss_index()
 
@@ -92,6 +97,7 @@ class FaissVectorDBStorage(BaseVectorStorage):
                 # Reload data
                 self._index = faiss.IndexFlatIP(self._dim)
                 self._id_to_meta = {}
+                self._pending_delete_count = 0
                 self._load_faiss_index()
                 self.storage_updated.value = False
             return self._index
@@ -217,6 +223,10 @@ class FaissVectorDBStorage(BaseVectorStorage):
                 continue
 
             meta = self._id_to_meta.get(idx, {})
+            if not meta:
+                # Orphaned fid (vector in _index but already deleted from _id_to_meta;
+                # awaiting next compact). Skip.
+                continue
             # Filter out __vector__ from query results to avoid returning large vector data
             filtered_meta = {k: v for k, v in meta.items() if k != "__vector__"}
             results.append(
@@ -309,16 +319,41 @@ class FaissVectorDBStorage(BaseVectorStorage):
 
     async def _remove_faiss_ids(self, fid_list):
         """
-        Remove a list of internal Faiss IDs from the index.
-        Because IndexFlatIP doesn't support 'removals',
-        we rebuild the index excluding those vectors.
-        """
-        keep_fids = [fid for fid in self._id_to_meta if fid not in fid_list]
+        Mark a list of internal Faiss IDs as deleted.
 
-        # Rebuild the index
+        IndexFlatIP does not support in-place removal, so the original
+        implementation rebuilt the whole index on every delete call.
+        At N>30K that becomes the dominant cost during merge-heavy ingest
+        (a single rebuild dominates per-merge wall time).
+
+        Strategy here: pop from `_id_to_meta` immediately so subsequent
+        `_find_faiss_id_by_custom_id` and `query()` ignore them, but
+        keep the vectors in `_index` until the orphaned-count crosses
+        `_compact_threshold`. At that point (and unconditionally before
+        every save in `_save_faiss_index`), rebuild the index from the
+        live `_id_to_meta`. This amortizes the O(N) rebuild cost across
+        many deletes without introducing any cross-process state split:
+        `_id_to_meta` remains the single source of truth for live entries,
+        and the index file on disk is always a compacted snapshot.
+        """
+        async with self._storage_lock:
+            popped = 0
+            for fid in fid_list:
+                if self._id_to_meta.pop(fid, None) is not None:
+                    popped += 1
+            self._pending_delete_count += popped
+            if self._pending_delete_count >= self._compact_threshold:
+                self._compact_locked()
+
+    def _compact_locked(self):
+        """Rebuild `_index` from live `_id_to_meta`, dropping orphans.
+
+        Caller must hold `_storage_lock`. Safe in pure-async single-thread
+        context because numpy/faiss calls below do not yield.
+        """
         vectors_to_keep = []
         new_id_to_meta = {}
-        for old_fid in keep_fids:
+        for old_fid in sorted(self._id_to_meta.keys()):
             vec_meta = self._id_to_meta[old_fid]
             if "__vector__" in vec_meta:
                 vec = vec_meta["__vector__"]
@@ -327,7 +362,7 @@ class FaissVectorDBStorage(BaseVectorStorage):
                 vec_meta["__vector__"] = vec
             else:
                 logger.warning(
-                    f"[{self.workspace}] Skipping fid={old_fid} during rebuild: "
+                    f"[{self.workspace}] Skipping fid={old_fid} during compact: "
                     f"no vector and fid exceeds index size ({self._index.ntotal})"
                 )
                 continue
@@ -335,19 +370,25 @@ class FaissVectorDBStorage(BaseVectorStorage):
             vectors_to_keep.append(vec)
             new_id_to_meta[new_fid] = vec_meta
 
-        async with self._storage_lock:
-            # Re-init index
-            self._index = faiss.IndexFlatIP(self._dim)
-            if vectors_to_keep:
-                arr = np.array(vectors_to_keep, dtype=np.float32)
-                self._index.add(arr)
-
-            self._id_to_meta = new_id_to_meta
+        self._index = faiss.IndexFlatIP(self._dim)
+        if vectors_to_keep:
+            arr = np.array(vectors_to_keep, dtype=np.float32)
+            self._index.add(arr)
+        self._id_to_meta = new_id_to_meta
+        self._pending_delete_count = 0
 
     def _save_faiss_index(self):
         """
         Save the current Faiss index + metadata to disk so it can persist across runs.
+
+        Always compact first so the on-disk index has no orphaned fids — keeps
+        the disk format identical to pre-patch behavior and makes a fresh load
+        start with `_pending_delete_count == 0` and contiguous fids.
+        Caller must hold `_storage_lock`; numpy/faiss inside `_compact_locked`
+        do not yield so the compact-then-save sequence is atomic w.r.t. asyncio.
         """
+        if self._pending_delete_count > 0:
+            self._compact_locked()
         faiss.write_index(self._index, self._faiss_index_file)
 
         # Save metadata dict to JSON, excluding __vector__ since vectors are
@@ -412,6 +453,9 @@ class FaissVectorDBStorage(BaseVectorStorage):
             logger.info(
                 f"[{self.workspace}] Faiss index loaded with {self._index.ntotal} vectors from {self._faiss_index_file}"
             )
+            # Disk is always saved in compacted form (see _save_faiss_index),
+            # so after a fresh load there are no orphaned fids.
+            self._pending_delete_count = 0
         except Exception as e:
             if dim_mismatch:
                 raise
@@ -421,6 +465,7 @@ class FaissVectorDBStorage(BaseVectorStorage):
             logger.warning(f"[{self.workspace}] Starting with an empty Faiss index.")
             self._index = faiss.IndexFlatIP(self._dim)
             self._id_to_meta = {}
+            self._pending_delete_count = 0
 
     async def index_done_callback(self) -> None:
         async with self._storage_lock:
@@ -432,6 +477,7 @@ class FaissVectorDBStorage(BaseVectorStorage):
                 )
                 self._index = faiss.IndexFlatIP(self._dim)
                 self._id_to_meta = {}
+                self._pending_delete_count = 0
                 self._load_faiss_index()
                 self.storage_updated.value = False
                 return False  # Return error
